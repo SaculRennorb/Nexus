@@ -101,9 +101,17 @@ namespace Loader
 
 	///----------------------------------------------------------------------------------------------------
 	/// LoadAddon:
-	/// 	Loads an addon.
+	/// 	Loads an addon form disk and validates its definition. Does not do dependency resolution.
 	///----------------------------------------------------------------------------------------------------
-	void LoadAddon(const std::filesystem::path& aPath, bool aIsReload = false);
+	Addon* PreloadAddon(const std::filesystem::path& aPath, bool aIsReload = false);
+
+	///----------------------------------------------------------------------------------------------------
+	/// LoadAddon:
+	/// 	Finalizes loading an addon, including dependency resolution.
+	/// 	Existing addon from preload can be passed in as the second argument.
+	/// 	Otherwise this fn fill use the path to find a candidate to finalize.
+	///----------------------------------------------------------------------------------------------------
+	void LoadAddon(const std::filesystem::path& aPath, Addon* addon, bool aIsReload = false);
 	
 	///----------------------------------------------------------------------------------------------------
 	/// UnloadAddon:

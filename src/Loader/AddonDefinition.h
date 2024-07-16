@@ -21,7 +21,7 @@ struct AddonVersion
 	signed short	Revision;
 
 	AddonVersion() = default;
-	AddonVersion(signed short aMajor, signed short aMinor, signed short aBuild, signed short aRevision)
+	constexpr AddonVersion(signed short aMajor, signed short aMinor, signed short aBuild, signed short aRevision)
 		: Major{ aMajor }
 		, Minor{ aMinor }
 		, Build{ aBuild }
@@ -40,6 +40,27 @@ bool operator!=(AddonVersion lhs, AddonVersion rhs);
 bool operator<=(AddonVersion lhs, AddonVersion rhs);
 bool operator>=(AddonVersion lhs, AddonVersion rhs);
 
+struct Capability {
+	char const* Name;
+	AddonVersion Version;
+
+	[[nodiscard]] inline constexpr bool IsTerminator() const noexcept { return !this->Name; }
+};
+struct CapabilityRequirement
+{
+	char const* Capability;
+	AddonVersion MinVersion, MaxVersion;
+	signed int SatisfiedBy; // set by nexus after loading the addon
+	enum {
+		Optional = 1 << 0,
+	} Flags;
+
+	static inline constexpr AddonVersion UNBOUNDED_VERSION {};
+	static inline constexpr signed int UNSATISFIED {0};
+	[[nodiscard]] inline constexpr bool IsTerminator() const noexcept { return !this->Capability; }
+};
+
+
 struct AddonDefinition
 {
 	/* required */
@@ -56,6 +77,9 @@ struct AddonDefinition
 	/* update fallback */
 	EUpdateProvider Provider;       /* What platform is the the addon hosted on */
 	const char*     UpdateLink;     /* Link to the update resource */
+
+	Capability* ProvidesCapabilities; // terminated list. the terminator has a null name ptr 
+	CapabilityRequirement* RequiredCapabilities; // terminated list. the terminator has a null capability ptr
 
 	/* internal */
 	bool HasMinimumRequirements();

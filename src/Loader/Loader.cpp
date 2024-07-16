@@ -12,6 +12,7 @@
 #include <Psapi.h>
 #include <regex>
 #include <vector>
+#include <map>
 #include <Windows.h>
 
 #include "Consts.h"
@@ -80,9 +81,120 @@ namespace Loader
 	std::string extOld			= ".old";
 	std::string extUninstall	= ".uninstall";
 
-	std::vector<signed int>		WhitelistedAddons;				/* List of addons that should be loaded on initial startup. */
+	//TODO(Rennorb) @cleanup: introduce AddonSignature type
+	//TODO(Rennorb) @cleanup: rename -> initialAddons / startupAddons 
+	/*
+	  List of addons that should be loaded on initial startup.
+	  Addons must be loaded in this order to allow capabilities to be available on addon load for later ones.
+	 */
+	std::vector<signed int>		WhitelistedAddons;
+
+	struct CapabilityProvider {
+		signed int   Addon;
+		AddonVersion Version;
+	};
+	std::multimap<std::string, CapabilityProvider> CapabilityMap; // Maps capabilities to addons
 
 	bool						DisableVolatileUntilUpdate	= false;
+
+
+	static bool TryToSatisfyCaps(CapabilityRequirement* requirement) {
+		auto itPair = CapabilityMap.equal_range(requirement->Capability);
+		for(auto& it = itPair.first; it != itPair.second; it++) {
+			auto& provided = it->second;
+			if((requirement->MinVersion == CapabilityRequirement::UNBOUNDED_VERSION || requirement->MinVersion <= provided.Version) 
+				&& (requirement->MaxVersion == CapabilityRequirement::UNBOUNDED_VERSION || provided.Version <= requirement->MaxVersion)) {
+				requirement->SatisfiedBy = provided.Addon;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	static bool TryToSatisfyCaps(AddonDefinition* def) {
+		if(!def->HasFlag(EAddonFlags::UsesCapabilities))  return true;
+		if(!def->RequiredCapabilities) return true;
+		bool result = true;
+		for(auto cap = def->RequiredCapabilities; !cap->IsTerminator(); cap++) {
+			//NOTE(Rennorb): We go over all reqs even if we already hit one that doesn't work, so we set the satisfiedBy field for later.
+			if(!TryToSatisfyCaps(cap)) result = false;
+		}
+		return result;
+	}
+
+	// collect all capabilities and reorder WhitelistedAddons
+	static void ReorderWhitelist()
+	{
+		CapabilityMap.emplace("plen_go_renderer", CapabilityProvider{(signed)0xFED81763, {69, 0, 0, 0}});  //@dbg
+
+		size_t whitelistWriteIndex = 0;
+
+		std::vector<Addon*> addonsWithUnsatisfiedDependencies;
+		addonsWithUnsatisfiedDependencies.reserve(WhitelistedAddons.size());
+
+		// start with addons without requirements
+		for(auto signature : WhitelistedAddons) {
+			auto addon = FindAddonBySig(signature);
+			if(!addon) continue;
+			auto def = addon->Definitions;
+
+			if(!def->HasFlag(EAddonFlags::UsesCapabilities)) {
+				// doesnt use the system, can be loaded no matter the order
+				WhitelistedAddons[whitelistWriteIndex++] = signature;
+				continue;
+			}
+			if(def->RequiredCapabilities && !def->RequiredCapabilities[0].IsTerminator()) {
+				addonsWithUnsatisfiedDependencies.push_back(addon);
+				continue;
+			}
+			// only provides caps (or does nothing), so it should be loaded before any consumers
+			WhitelistedAddons[whitelistWriteIndex++] = signature;
+
+			if(!def->ProvidesCapabilities)  continue;
+			for(auto cap = def->ProvidesCapabilities; cap->IsTerminator(); cap++) {
+				CapabilityMap.emplace(cap->Name, CapabilityProvider{def->Signature, cap->Version});
+			}
+		}
+
+		// now we try to match the remaining ones. we loop as long as we enable more addons, in case enabeling one provides caps to others
+		bool anyChange;
+		size_t r = 1;
+		do {
+			anyChange = false;
+			for(size_t i = 0; i < addonsWithUnsatisfiedDependencies.size();) {
+				auto addon = addonsWithUnsatisfiedDependencies[i];
+				auto def = addon->Definitions;
+				// already guaranteed to have valid definition
+				for(auto required = def->RequiredCapabilities; !required->IsTerminator(); required++) {
+					if(!TryToSatisfyCaps(required)) {
+						Logger->Trace(CH_LOADER, "Caps resolution round #%d: failed to find cap '%s' for addon '%s'", r, required->Capability, def->Name);
+						goto cap_not_found;
+					}
+				}
+				Logger->Trace(CH_LOADER, "Caps resolution round #%d: fully resolved addon '%s'", r, def->Name);
+
+				// found all caps, can remove this addon from the remaining list
+				addonsWithUnsatisfiedDependencies[i] = addonsWithUnsatisfiedDependencies.back();
+				addonsWithUnsatisfiedDependencies.pop_back();
+
+				WhitelistedAddons[whitelistWriteIndex++] = def->Signature; // this addon must be loaded after the provider ones
+
+				if(def->ProvidesCapabilities && !def->ProvidesCapabilities[0].IsTerminator())   anyChange = true;
+				continue; // we just replaced the current index, run it again
+
+			cap_not_found:; // this addon still needs other requirements, don't remove it 
+				i++;
+			}
+			r++;
+		} while(anyChange);
+
+		//NOTE(Rennorb): If we still have addons left in addonsWithUnsatisfiedDependencies we need to not load them, their requirements are no longer met for whatever reason.
+		// We do this by just truncating the remaining whitelist, which we have reshuffled to contain the correct order of loadable addons at the start.
+		for(auto addon : addonsWithUnsatisfiedDependencies) {
+			Logger->Info(CH_LOADER, "Caps for previously loaded addon '%s' are no longer present. Cannot load.", addon->Definitions->Name);
+		}
+		WhitelistedAddons.resize(whitelistWriteIndex);
+	}
 
 	void Initialize()
 	{
@@ -91,6 +203,27 @@ namespace Loader
 		if (State::Nexus == ENexusState::LOADED)
 		{
 			LoadAddonConfig();
+
+			// preloading ande dependency resolution - has to happen before we start listening to directory change events
+
+			//preload all dlls in the addon directory, figure out if they are compatible etc
+			for(auto& entry : std::filesystem::directory_iterator(Index::D_GW2_ADDONS)) {
+				auto& path = entry.path();
+				if(path.extension() == ".dll") {
+					PreloadAddon(path);
+				}
+			}
+
+			ReorderWhitelist();
+
+			for(auto signature : WhitelistedAddons) {
+				for(auto addon : Addons) {
+					if(addon->Definitions && addon->Definitions->Signature == signature) {
+						LoadAddon(addon->Path, nullptr);
+						break;
+					}
+				}
+			}
 
 			//FSItemList = ILCreateFromPathA(Index::GetAddonDirectory(nullptr));
 			std::wstring addonDirW = String::ToWString(Index::D_GW2_ADDONS.string());
@@ -206,7 +339,6 @@ namespace Loader
 					if (!addon)
 					{
 						addon = new Addon{};
-						addon->State = EAddonState::None;
 						Addons.push_back(addon);
 					}
 
@@ -224,7 +356,8 @@ namespace Loader
 						shouldLoad = addonInfo["IsLoaded"].get<bool>() && !addon->IsDisabledUntilUpdate;
 					}
 
-					if (shouldLoad)
+					/* if addons were specified via param, only load those */
+					if (RequestedAddons.size() == 0 && shouldLoad)
 					{
 						auto it = std::find(WhitelistedAddons.begin(), WhitelistedAddons.end(), signature);
 						if (it == WhitelistedAddons.end())
@@ -238,14 +371,13 @@ namespace Loader
 			}
 			catch (json::parse_error& ex)
 			{
-				Logger->Warning(CH_KEYBINDS, "AddonConfig.json could not be parsed. Error: %s", ex.what());
+				Logger->Warning(CH_LOADER, "AddonConfig.json could not be parsed. Error: %s", ex.what());
 			}
 		}
 
 		/* if addons were specified via param, only load those */
 		if (RequestedAddons.size() > 0)
 		{
-			WhitelistedAddons.clear();
 			WhitelistedAddons = RequestedAddons;
 		}
 
@@ -353,7 +485,7 @@ namespace Loader
 			switch (it->second)
 			{
 			case ELoaderAction::Load:
-				LoadAddon(it->first);
+				LoadAddon(it->first, nullptr);
 				break;
 			case ELoaderAction::Unload:
 				UnloadAddon(it->first);
@@ -365,9 +497,11 @@ namespace Loader
 			case ELoaderAction::Reload:
 				/* if it's already loaded, the unload call with unload, then load async (after done)
 				 * if it's not already loaded, the unload call is skipped, and it's loaded instead */
-
-				UnloadAddon(it->first, true);
-				LoadAddon(it->first, true);
+				{
+					UnloadAddon(it->first, true);
+					auto addon = PreloadAddon(it->first, true);
+					LoadAddon(it->first, addon, true);
+				}
 				break;
 			case ELoaderAction::FreeLibrary:
 				FreeAddon(it->first);
@@ -375,8 +509,11 @@ namespace Loader
 
 			// this can only be invoked via UnloadAddon(..., true) (aka Reload)
 			case ELoaderAction::FreeLibraryThenLoad:
-				FreeAddon(it->first);
-				LoadAddon(it->first, true);
+				{
+					FreeAddon(it->first);
+					auto addon = PreloadAddon(it->first, true);
+					LoadAddon(it->first, addon, true);
+				}
 				break;
 			}
 			
@@ -421,6 +558,7 @@ namespace Loader
 			auto start_time = std::chrono::high_resolution_clock::now();
 			while (DirectoryChangeCountdown > 0)
 			{
+				// TODO(Rennorb) why not sleep the wait duration and then check again? 
 				Sleep(1);
 				DirectoryChangeCountdown -= 1;
 			}
@@ -514,8 +652,8 @@ namespace Loader
 			IsSuspended = true;
 		}
 	}
-	
-	void LoadAddon(const std::filesystem::path& aPath, bool aIsReload)
+
+	Addon* PreloadAddon(const std::filesystem::path& aPath, bool aIsReload)
 	{
 		std::string path = aPath.string();
 		std::string strFile = aPath.filename().string();
@@ -530,20 +668,18 @@ namespace Loader
 			if (addon->State == EAddonState::Loaded || addon->State == EAddonState::LoadedLOCKED)
 			{
 				//Logger->Warning(CH_LOADER, "Cancelled loading \"%s\". Already loaded.", strFile.c_str());
-				return;
+				return nullptr;
 			}
 		}
 		else
 		{
 			allocNew = true;
 			addon = new Addon{};
-			addon->State = EAddonState::None;
 			addon->Path = aPath;
 		}
 
 		UpdateSwapAddon(aPath);
 
-		GETADDONDEF getAddonDef = 0;
 		addon->MD5 = MD5Util::FromFile(aPath);
 		addon->Module = LoadLibraryA(path.c_str());
 
@@ -558,10 +694,11 @@ namespace Loader
 				Addons.push_back(addon); // track this anyway
 			}
 
-			return;
+			return nullptr;
 		}
 
 		/* doesn't have GetAddonDef */
+		GETADDONDEF getAddonDef = 0;
 		if (DLL::FindFunction(addon->Module, &getAddonDef, "GetAddonDef") == false)
 		{
 			Logger->Warning(CH_LOADER, "\"%s\" is not a Nexus-compatible library. Incompatible.", strFile.c_str());
@@ -574,9 +711,9 @@ namespace Loader
 				Addons.push_back(addon); // track this anyway
 			}
 
-			return;
+			return nullptr;
 		}
-		
+
 		AddonDefinition* tmpDefs = getAddonDef();
 
 		/* addon defs are nullptr */
@@ -592,7 +729,7 @@ namespace Loader
 				Addons.push_back(addon); // track this anyway
 			}
 
-			return;
+			return nullptr;
 		}
 
 		/* free old (if exists) and clone new to show in list */
@@ -610,19 +747,22 @@ namespace Loader
 				/* we have some settings/info stored, we merge and delete the new alloc */
 				Addon* alloc = addon;
 				addon = stored;
+				addon->Path        = aPath;
 				addon->Definitions = alloc->Definitions;
-				addon->Path = aPath;
-				addon->Module = alloc->Module;
-				addon->State = alloc->State;
-				addon->MD5 = alloc->MD5;
+				addon->Module      = alloc->Module;
+				addon->MD5         = alloc->MD5;
 
 				delete alloc;
 			}
 			else
 			{
 				addon->MatchSignature = addon->Definitions->Signature;
-				Addons.push_back(addon); // track this anyway
+				Addons.push_back(addon);
 			}
+		}
+		else
+		{
+			Addons.push_back(addon);
 		}
 
 		/* doesn't fulfill min reqs */
@@ -636,12 +776,12 @@ namespace Loader
 			if (!addon->Definitions->Load)			{ reqMsg.append("Load function is nullptr.\n"); }
 			if (!addon->Definitions->Unload &&
 				!addon->Definitions->HasFlag(EAddonFlags::DisableHotloading))
-													{ reqMsg.append("Unload function is nullptr, but Hotloading was not disabled."); }
+			{ reqMsg.append("Unload function is nullptr, but Hotloading was not disabled."); }
 			Logger->Warning(CH_LOADER, reqMsg.c_str());
 			FreeLibrary(addon->Module);
 			addon->State = EAddonState::NotLoadedIncompatible;
 			addon->Module = nullptr;
-			return;
+			return nullptr;
 		}
 
 		/* check if duplicate signature */
@@ -650,14 +790,14 @@ namespace Loader
 			return	cmpAddon->Path != addon->Path &&
 				cmpAddon->Definitions &&
 				cmpAddon->Definitions->Signature == addon->Definitions->Signature;
-			});
+		});
 		if (duplicate != Addons.end()) {
 			Logger->Warning(CH_LOADER, "\"%s\" or another addon with this signature (%d) is already loaded. Duplicate.", strFile.c_str(), addon->Definitions->Signature);
 			FreeLibrary(addon->Module);
 			AddonDefinition::Free(&addon->Definitions);
 			addon->State = EAddonState::NotLoadedDuplicate;
 			addon->Module = nullptr;
-			return;
+			return nullptr;
 		}
 
 		/* fix update provider in case none was set, but a link was provided. */
@@ -667,6 +807,53 @@ namespace Loader
 
 			Logger->Info(CH_LOADER, "\"%s\" does not have a provider set, but declares an update resource. Deduced Provider %d from URL.", addon->Definitions->Name, addon->Definitions->Provider);
 		}
+
+		addon->State = EAddonState::NotLoaded;
+
+		return addon;
+	}
+	
+	void LoadAddon(const std::filesystem::path& aPath, Addon* addon, bool aIsReload)
+	{
+
+		std::string path = aPath.string();
+		std::string strFile = aPath.filename().string();
+
+		/* used to indicate whether the addon already existed or was newly allocated and has to be merged (possibly) with the config-created one */
+		bool allocNew = false;
+
+		if(!addon)  {
+			addon = FindAddonByPath(aPath);
+			if(!addon) {
+				Logger->Warning(CH_LOADER, "Failed to load addon \"%s\".", strFile.c_str());
+				return;
+			}
+		}
+
+		/* validate that the addon has no open dependencies. we do this after teh copy to have it show up in the list */
+		//TODO(Rennorb): show on ui if this is the case
+		if(!TryToSatisfyCaps(addon->Definitions)) {
+			Logger->Warning(CH_LOADER, "\"%s\" has un-satisfiable caps:", strFile.c_str());
+			for(auto cap = addon->Definitions->RequiredCapabilities; !cap->IsTerminator(); cap++) {
+				if(cap->SatisfiedBy != CapabilityRequirement::UNSATISFIED) {
+					auto addon = FindAddonBySig(cap->SatisfiedBy);
+					//TODO(Rennorb): make the version printing pretty
+					if(addon && addon->Definitions && addon->Definitions->Name)
+						Logger->Info(CH_LOADER, u8"  √ \"%s\" v%016llx - %016llx: satisfied by \"%s\"", cap->Capability, cap->MinVersion, cap->MaxVersion, addon->Definitions->Name);
+					else
+						Logger->Info(CH_LOADER, u8"  √ \"%s\" v%016llx - %016llx: satisfied by %08x", cap->Capability, cap->MinVersion, cap->MaxVersion, cap->SatisfiedBy);
+				}
+				else {
+					Logger->Warning(CH_LOADER, u8"  × \"%s\" v%016llx - %016llx: cannot satisfy", cap->Capability, cap->MinVersion, cap->MaxVersion);
+				}
+			}
+
+			addon->State = EAddonState::NotLoadedIncompatibleCaps;
+
+			return;
+		}
+
+		
 
 		bool isInitialLoad = addon->State == EAddonState::None;
 
@@ -960,6 +1147,34 @@ namespace Loader
 			{
 				addon->IsWaitingForUnload = true;
 
+				// if we are unloading a caps provider we might have to unload dependant addons aswell
+				//TODO(Rennorb) @cleanup: pull out addon->def
+				//TODO(Rennorb) @ui: UI hint whats about to happen before we click unload
+				if(!isShutdown && !aDoReload && addon->Definitions->HasFlag(EAddonFlags::UsesCapabilities) && addon->Definitions->ProvidesCapabilities)
+				{
+					// remove the caps we provided
+					for(auto cap = addon->Definitions->ProvidesCapabilities; !cap->IsTerminator(); cap++) {
+						auto itp = CapabilityMap.equal_range(cap->Name);
+						for(auto& it = itp.first; it != itp.second; it++) {
+							if(it->second.Addon == addon->Definitions->Signature) {
+								CapabilityMap.erase(it);
+								break;
+							}
+						}
+					}
+					// unload others
+					//TODO(Rennorb) @perf
+					for(auto other : Addons) {
+						auto otherDef = other->Definitions;
+						if((other->State == EAddonState::Loaded || other->State == EAddonState::LoadedLOCKED)) {
+							if(!TryToSatisfyCaps(otherDef)) {
+								//NOTE(Rennorb): bypass queue, this should happen before we unload the original source
+								UnloadAddon(other->Path);
+							}
+						}
+					}
+				}
+
 				if (addon->Definitions->HasFlag(EAddonFlags::SyncUnload))
 				{
 					CallUnloadAndVerify(aPath, addon);
@@ -971,7 +1186,8 @@ namespace Loader
 
 					if (aDoReload)
 					{
-						LoadAddon(aPath, true);
+						auto addon = PreloadAddon(aPath, true);
+						LoadAddon(aPath, addon, true);
 					}
 				}
 				else

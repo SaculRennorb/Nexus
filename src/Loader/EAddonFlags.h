@@ -7,7 +7,8 @@ enum class EAddonFlags
 	IsVolatile							= 1 << 0,	/* is hooking functions or doing anything else that's volatile and game build dependant */
 	DisableHotloading					= 1 << 1,	/* prevents unloading at runtime, aka. will require a restart if updated, etc. */
 	OnlyLoadDuringGameLaunchSequence	= 1 << 2,	/* prevents loading later than character select, aka will require restart to get loaded */
-	SyncUnload							= 1 << 3	/* unloading the addon will be synchronous, rather than async and will stall the render thread */
+	SyncUnload							= 1 << 3,	/* unloading the addon will be synchronous, rather than async and will stall the render thread */
+	UsesCapabilities					= 1 << 4,	/* Indicates that the addon definition contains capabilites and requested capabilities at the end. if hts is not set the fields wil be ignored */
 };
 
 EAddonFlags operator|(EAddonFlags lhs, EAddonFlags rhs);
